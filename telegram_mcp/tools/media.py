@@ -15,6 +15,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
 from telegram_mcp import media_links
+from telegram_mcp import remote_media
 from telegram_mcp import transcription
 from telegram_mcp import video as video_tools
 from telegram_mcp import runtime as _runtime
@@ -614,9 +615,22 @@ async def download_media(
     media_id: Optional[Union[int, str]] = None,
     ctx: Optional[Context] = None,
     account: Optional[str] = None,
-) -> str:
+):
     """
     Download media from a message in a chat.
+
+    The file is saved on the MCP server under the allowed roots, keeping the
+    sender's original filename. Returns a JSON summary {Success, Message,
+    MediaType, Filename, Path, Size, Embedded, DownloadUrl?} as the first
+    content block. For remote MCP clients, files up to 5 MiB are ALSO embedded
+    in the result: images as ImageContent, audio as AudioContent, documents
+    (PDF, DOCX, XLSX, DXF, ...) as an EmbeddedResource blob. Larger PDFs are
+    recompressed with Ghostscript and larger images downscaled, and the smaller
+    copy is embedded when it fits (a note says so); the original stays
+    untouched at Path. Videos are never embedded. Idempotent: calling again for
+    the same message reuses the downloaded file instead of re-downloading. A
+    slow download/compression keeps running in the background and the call
+    returns {"InProgress": true}; call again with the same arguments shortly.
     Args:
         chat_id: The chat ID or username.
         message_id: The message ID containing the media.
@@ -665,7 +679,14 @@ async def download_media(
         if declared_size is not None and declared_size > limit:
             return f"Media is too large for download_media (limit: {limit} bytes)."
 
-        default_name = f"telegram_{chat_id}_{message_id}_{int(time.time())}_{uuid4().hex}"
+        kind = remote_media.media_kind(target)
+        fallback = f"telegram_{chat_id}_{message_id}" + (f"_{media_id}" if media_id else "")
+        orig_name = remote_media.original_filename(target)
+        default_name = (
+            f"{message_id}_{remote_media.safe_original_name(orig_name, fallback)}"
+            if orig_name
+            else fallback
+        )
         out_path, path_error = await _resolve_writable_file_path(
             raw_path=file_path,
             default_filename=default_name,
@@ -675,56 +696,89 @@ async def download_media(
         if path_error:
             return path_error
 
-        temp_dir = Path(
-            tempfile.mkdtemp(prefix=".telegram-mcp-download-", dir=str(out_path.parent))
+        media_uri = f"telegram://media/{chat_id}/{message_id}" + (
+            f"/{media_id}" if media_id else ""
         )
-        try:
-            staged_name = out_path.with_suffix("").name if out_path.suffix else out_path.name
-            temp_requested_path = temp_dir / staged_name
 
-            def enforce_download_limit(received: int, total: int) -> None:
-                if received > limit or (total and total > limit):
-                    raise _DownloadLimitExceeded
+        def _result(path: Path, cached: bool):
+            return remote_media.build_download_result(
+                path=path,
+                kind=kind,
+                filename=orig_name or path.name,
+                uri=media_uri,
+                cached=cached,
+                download_url=media_links.download_url(path, _first_server_root()),
+            )
 
+        # Idempotent: reuse an earlier download of the same message (same
+        # declared size), so a retry after a client-side timeout is instant.
+        def _cached_download() -> Optional[Path]:
+            if file_path and file_path.strip():
+                return None
+            candidates = [out_path] if out_path.suffix else []
+            candidates += sorted(out_path.parent.glob(out_path.name + ".*"))
+            for existing in candidates:
+                if (
+                    existing.is_file()
+                    and not existing.name.startswith(".")
+                    and (declared_size is None or existing.stat().st_size == declared_size)
+                ):
+                    return existing
+            return None
+
+        cached_path = _cached_download()
+        if cached_path is not None:
+            return await remote_media.run_job(
+                str(out_path), lambda: _result(cached_path, cached=True)
+            )
+
+        async def _download_job():
+            temp_dir = Path(
+                tempfile.mkdtemp(prefix=".telegram-mcp-download-", dir=str(out_path.parent))
+            )
             try:
-                downloaded = await cl.download_media(
-                    target,
-                    file=str(temp_requested_path),
-                    progress_callback=enforce_download_limit,
-                )
-            except _DownloadLimitExceeded:
-                return f"Media is too large for download_media (limit: {limit} bytes)."
+                staged_name = out_path.with_suffix("").name if out_path.suffix else out_path.name
+                temp_requested_path = temp_dir / staged_name
 
-            if not downloaded:
-                return f"Download failed for message {message_id}."
+                def enforce_download_limit(received: int, total: int) -> None:
+                    if received > limit or (total and total > limit):
+                        raise _DownloadLimitExceeded
 
-            temp_final_path = Path(downloaded).resolve(strict=True)
-            if temp_final_path.parent != temp_dir.resolve():
-                return "Download failed: resulting temporary path is invalid."
-            if temp_final_path.stat().st_size > limit:
-                return f"Media is too large for download_media (limit: {limit} bytes)."
+                try:
+                    downloaded = await cl.download_media(
+                        target,
+                        file=str(temp_requested_path),
+                        progress_callback=enforce_download_limit,
+                    )
+                except _DownloadLimitExceeded:
+                    return f"Media is too large for download_media (limit: {limit} bytes)."
 
-            final_path = out_path
-            if temp_final_path.suffix:
-                final_path, path_error = await _resolve_writable_file_path(
-                    raw_path=str(out_path.with_suffix(temp_final_path.suffix)),
-                    default_filename=default_name,
-                    ctx=ctx,
-                    tool_name="download_media",
-                )
-                if path_error:
-                    return path_error
+                if not downloaded:
+                    return f"Download failed for message {message_id}."
 
-            os.replace(temp_final_path, final_path)
-            url = media_links.download_url(final_path, _first_server_root())
-            if url:
-                return (
-                    f"Media downloaded to {final_path}. "
-                    f"From another machine, fetch it from {url} (expires in an hour)."
-                )
-            return f"Media downloaded to {final_path}."
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+                temp_final_path = Path(downloaded).resolve(strict=True)
+                if temp_final_path.parent != temp_dir.resolve():
+                    return "Download failed: resulting temporary path is invalid."
+                if temp_final_path.stat().st_size > limit:
+                    return f"Media is too large for download_media (limit: {limit} bytes)."
+
+                final_path = out_path
+                if temp_final_path.suffix:
+                    final_path, path_error = await _resolve_writable_file_path(
+                        raw_path=str(out_path.with_suffix(temp_final_path.suffix)),
+                        default_filename=default_name,
+                        ctx=ctx,
+                        tool_name="download_media",
+                    )
+                    if path_error:
+                        return path_error
+
+                os.replace(temp_final_path, final_path)
+                return await _result(final_path, cached=False)
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        return await remote_media.run_job(str(out_path), _download_job)
     except Exception as e:
         return log_and_format_error(
             "download_media",

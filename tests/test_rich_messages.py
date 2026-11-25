@@ -555,7 +555,7 @@ async def test_download_media_fetches_embedded_rich_video(tmp_path, monkeypatch)
     result = await _download_media(123, 225)
 
     assert client.downloaded == [doc]  # the rich document, not the bare message
-    assert result.startswith("Media downloaded to")
+    assert json.loads(result[0].text)["Message"].startswith("Media downloaded to")
 
 
 @pytest.mark.asyncio

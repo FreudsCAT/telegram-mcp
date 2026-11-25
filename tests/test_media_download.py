@@ -1,3 +1,4 @@
+import json
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -70,7 +71,9 @@ class _Client:
 
 
 @pytest.mark.asyncio
-async def test_default_download_paths_do_not_collide_when_time_is_frozen(tmp_path, monkeypatch):
+async def test_default_download_reuses_cached_file_for_same_message(tmp_path, monkeypatch):
+    # download_media is idempotent per message: a second call reuses the first
+    # download (so a retry after a client timeout is instant) instead of a copy.
     message = _message(size=3)
     payloads = iter((b"one", b"two"))
 
@@ -85,12 +88,11 @@ async def test_default_download_paths_do_not_collide_when_time_is_frozen(tmp_pat
     first = await _call_default_download(monkeypatch, tmp_path, client, message)
     second = await _call_default_download(monkeypatch, tmp_path, client, message)
 
-    prefix = "Media downloaded to "
-    first_path = Path(first.removeprefix(prefix).removesuffix("."))
-    second_path = Path(second.removeprefix(prefix).removesuffix("."))
-    assert first_path != second_path
+    first_path = Path(json.loads(first[0].text)["Path"])
+    second = json.loads(second[0].text)
+    assert Path(second["Path"]) == first_path
+    assert second["Message"].endswith("(cached)")
     assert first_path.read_bytes() == b"one"
-    assert second_path.read_bytes() == b"two"
 
 
 @pytest.mark.asyncio
@@ -217,6 +219,8 @@ async def test_download_media_stages_atomically_and_preserves_detected_extension
 
     result = await _call_download(monkeypatch, requested, client, message)
 
-    assert result == f"Media downloaded to {final_path.resolve()}."
+    summary = json.loads(result[0].text)
+    assert summary["Path"] == str(final_path.resolve())
+    assert summary["Message"] == f"Media downloaded to {final_path.resolve()}."
     assert final_path.read_bytes() == b"new"
     assert list(tmp_path.iterdir()) == [final_path]

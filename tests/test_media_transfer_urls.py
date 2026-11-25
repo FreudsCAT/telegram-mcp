@@ -154,8 +154,11 @@ async def test_download_media_reports_the_url(root, monkeypatch):
 
     result = await _download_media(123, 7, file_path=str(target))
 
-    assert result.startswith(f"Media downloaded to {target}. From another machine, fetch it from ")
-    assert f"{BASE}/media/downloads/doc.pdf?" in result
+    summary = json.loads(result[0].text)
+    assert summary["Message"].startswith(
+        f"Media downloaded to {target}. From another machine, fetch it from "
+    )
+    assert f"{BASE}/media/downloads/doc.pdf?" in summary["DownloadUrl"]
 
 
 def test_sweep_removes_only_stale_upload_slots(root):
